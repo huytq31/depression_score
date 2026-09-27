@@ -1,6 +1,4 @@
-<<<<<<< HEAD
 .vscode/
-=======
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -219,4 +217,3 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
->>>>>>> 073af1575989f36f8f34ddd1e90c4b6c6b8b788e
