@@ -67,20 +67,6 @@ SEM_NODE_POSITIONS = {
     "ObservedCovariates": (2.0, -2.15),
 }
 
-SEM_EDGES = [
-    ("AcademicStress", "Anxiety"),
-    ("FinancialStress", "Anxiety"),
-    ("SocialIsolation", "Anxiety"),
-    ("VictimizationTrauma", "Anxiety"),
-    ("AcademicStress", "Depression"),
-    ("FinancialStress", "Depression"),
-    ("SocialIsolation", "Depression"),
-    ("VictimizationTrauma", "Depression"),
-    ("Anxiety", "Depression"),
-]
-
-OBSERVED_EDGE = ("ObservedCovariates", "Depression")
-
 NOTEBOOK_SIGNIFICANT_SEM_PATHS = [
     {"source": "AcademicStress", "target": "Anxiety", "beta": 0.493560, "p": 1.221245e-14},
     {"source": "SocialIsolation", "target": "Anxiety", "beta": 0.474230, "p": 6.661338e-16},
@@ -400,17 +386,6 @@ def infer_feature_group(feature_name: str) -> str:
     return "ObservedCovariates"
 
 
-def edge_contribution(edge: tuple[str, str], group_shap: dict[str, float]) -> float:
-    source, target = edge
-    if target == "Depression":
-        return group_shap.get(source, 0.0)
-    if target == "Anxiety":
-        anxiety_shap = group_shap.get("Anxiety", 0.0)
-        source_shap = group_shap.get(source, 0.0)
-        return source_shap if source_shap != 0 else anxiety_shap
-    return group_shap.get(source, 0.0)
-
-
 def display_feature_name(feature_name: str) -> str:
     return feature_name.replace("_score", "")
 
@@ -421,28 +396,17 @@ def format_p_value(p_value: float) -> str:
     return f"p = {p_value:.3f}"
 
 
-def choose_dominant_latent(group_summary: pd.DataFrame) -> str:
-    latent_summary = group_summary[group_summary["group"].isin(SEM_LATENT_GROUPS)]
-    if latent_summary.empty:
-        return "Anxiety"
-    return str(latent_summary.sort_values("group_abs", ascending=False).iloc[0]["group"])
-
-
 def build_bridge_summary(shap_table: pd.DataFrame, sem_paths: list[dict[str, Any]]) -> str:
-    top_shap = shap_table.copy()
-    top_shap["group"] = top_shap["feature"].astype(str).map(infer_feature_group)
-    group_summary = (
-        top_shap[top_shap["group"].isin(SEM_LATENT_GROUPS)]
-        .groupby("group", as_index=False)
-        .agg(group_shap=("shap_value", "sum"), group_abs=("abs_shap", "sum"))
-        .sort_values("group_abs", ascending=False)
-        .reset_index(drop=True)
-    )
+    group_summary = aggregate_individual_factors(shap_table)
+    group_summary = group_summary[
+        group_summary["group"].isin(SEM_LATENT_GROUPS)
+    ]
     if group_summary.empty:
         return ""
 
-    dominant_group = str(group_summary.iloc[0]["group"])
-    dominant_shap = float(group_summary.iloc[0]["group_shap"])
+    dominant = group_summary.iloc[0]
+    dominant_group = str(dominant["group"])
+    dominant_shap = float(dominant["group_shap"])
     upstream_sources = [
         path["source"]
         for path in sem_paths
@@ -473,6 +437,119 @@ def build_bridge_summary(shap_table: pd.DataFrame, sem_paths: list[dict[str, Any
     bridge += "\n- Note: SEM paths are population associations; SHAP values explain this individual prediction."
     return bridge
 
+def aggregate_individual_factors(
+    shap_table: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Aggregate feature-level SHAP values into conceptual groups.
+
+    group_shap:
+        Net contribution of the construct to this prediction.
+
+    group_abs:
+        Total absolute contribution of features belonging to the construct.
+    """
+    df = shap_table.copy()
+
+    df["group"] = (
+        df["feature"]
+        .astype(str)
+        .map(infer_feature_group)
+    )
+
+    summary = (
+        df.groupby("group", as_index=False)
+        .agg(
+            group_shap=("shap_value", "sum"),
+            group_abs=("abs_shap", "sum"),
+        )
+        .sort_values("group_abs", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    return summary
+
+def get_group_score(
+    group: str,
+    shap_table: pd.DataFrame,
+    raw_feature_values: pd.Series | None,
+) -> float | None:
+    """
+    Try to recover the individual's latent/construct score.
+    """
+
+    candidate_names = [
+        group,
+        f"{group}_score",
+    ]
+
+    # First try raw model input
+    if raw_feature_values is not None:
+        for name in candidate_names:
+            if name in raw_feature_values.index:
+                try:
+                    return float(raw_feature_values[name])
+                except (TypeError, ValueError):
+                    pass
+
+    # Then try SHAP feature table
+    for name in candidate_names:
+        match = shap_table[
+            shap_table["feature"].astype(str) == name
+        ]
+
+        if not match.empty:
+            try:
+                return float(match.iloc[0]["value"])
+            except (TypeError, ValueError):
+                pass
+
+    return None
+
+def get_sem_context_for_group(
+    group: str,
+    sem_paths: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    Find population-level SEM relationships surrounding a construct.
+
+    Returns:
+        {
+            "upstream": [...],
+            "downstream": [...]
+        }
+    """
+
+    upstream = []
+    downstream = []
+
+    for path in sem_paths:
+
+        source = str(path["source"])
+        target = str(path["target"])
+
+        if target == group:
+            upstream.append(path)
+
+        if source == group:
+            downstream.append(path)
+
+    upstream = sorted(
+        upstream,
+        key=lambda x: abs(float(x["beta"])),
+        reverse=True,
+    )
+
+    downstream = sorted(
+        downstream,
+        key=lambda x: abs(float(x["beta"])),
+        reverse=True,
+    )
+
+    return {
+        "upstream": upstream,
+        "downstream": downstream,
+    }
 
 def plot_shap_contribution_graph(
     shap_table: pd.DataFrame,
@@ -482,242 +559,608 @@ def plot_shap_contribution_graph(
     sem_paths: list[dict[str, Any]],
     raw_feature_values: pd.Series | None = None,
 ) -> plt.Figure:
-    top_shap = shap_table.head(int(max_display)).copy()
-    top_shap["group"] = top_shap["feature"].astype(str).map(infer_feature_group)
-    top_shap = top_shap.sort_values("abs_shap", ascending=False).reset_index(drop=True)
 
-    group_summary = (
-        top_shap.groupby("group", as_index=False)
-        .agg(group_shap=("shap_value", "sum"), group_abs=("abs_shap", "sum"))
-        .sort_values("group_abs", ascending=False)
+    # ============================================================
+    # PREPARE
+    # ============================================================
+
+    shap_table = shap_table.copy()
+
+    shap_table["group"] = (
+        shap_table["feature"]
+        .astype(str)
+        .map(infer_feature_group)
+    )
+
+    group_summary = aggregate_individual_factors(
+        shap_table
+    )
+
+    latent_summary = group_summary[
+        group_summary["group"].isin(
+            SEM_LATENT_GROUPS
+        )
+    ].copy()
+
+    latent_summary = (
+        latent_summary
+        .sort_values(
+            "group_abs",
+            ascending=False,
+        )
         .reset_index(drop=True)
     )
-    group_shap = dict(zip(group_summary["group"], group_summary["group_shap"]))
-    group_abs = dict(zip(group_summary["group"], group_summary["group_abs"]))
-    dominant_group = choose_dominant_latent(group_summary)
 
-    latent_shap = top_shap[top_shap["group"].isin(SEM_LATENT_GROUPS)].copy()
-    if latent_shap.empty:
-        latent_shap = top_shap.copy()
+    # show only meaningful latent constructs
+    top_groups = latent_summary.head(5)
 
-    max_abs_group = max(float(group_summary["group_abs"].max()), 1e-9)
+    if top_groups.empty:
+        top_groups = group_summary.head(5)
 
-    figure_height = max(9, 0.58 * len(latent_shap) + 5)
-    figure, axes = plt.subplots(
+    dominant_group = (
+        str(top_groups.iloc[0]["group"])
+        if not top_groups.empty
+        else None
+    )
+
+    # ============================================================
+    # FIGURE
+    # ============================================================
+
+    fig = plt.figure(
+        figsize=(15, 11),
+        facecolor="white",
+    )
+
+    gs = fig.add_gridspec(
         2,
         1,
-        figsize=(14, figure_height),
-        gridspec_kw={"height_ratios": [1.15, 1]},
+        height_ratios=[2.3, 1.5],
+        hspace=0.35,
     )
-    figure.patch.set_facecolor("white")
 
-    ax = axes[0]
-    ax.set_facecolor(PANEL_BACKGROUND)
+    ax = fig.add_subplot(gs[0])
+    ax_detail = fig.add_subplot(gs[1])
 
-    paths_to_draw = [
-        path for path in (sem_paths or NOTEBOOK_SIGNIFICANT_SEM_PATHS)
-        if path["source"] in SEM_NODE_POSITIONS
-        and path["target"] in SEM_NODE_POSITIONS
-    ]
-    if not paths_to_draw:
-        paths_to_draw = NOTEBOOK_SIGNIFICANT_SEM_PATHS
-    graph_nodes = list(
-        dict.fromkeys(
-            [path["source"] for path in paths_to_draw]
-            + [path["target"] for path in paths_to_draw]
-        )
+    # ============================================================
+    # A. INDIVIDUAL EXPLANATION GRAPH
+    # ============================================================
+
+    ax.axis("off")
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 10)
+
+    ax.set_title(
+        "Factors Associated With This Student's "
+        "Predicted Depression",
+        fontsize=15,
+        fontweight="bold",
+        pad=20,
     )
-    pos_sem = SEM_NODE_POSITIONS
-    edge_curves = {
-        ("AcademicStress", "Anxiety"): 0.08,
-        ("SocialIsolation", "Anxiety"): 0.0,
-        ("VictimizationTrauma", "Anxiety"): -0.08,
-        ("Anxiety", "Depression"): 0.0,
-        ("FinancialStress", "Depression"): -0.20,
-        ("SocialIsolation", "Depression"): 0.18,
-    }
-    edge_label_offsets = {
-        ("AcademicStress", "Anxiety"): 0.18,
-        ("SocialIsolation", "Anxiety"): 0.08,
-        ("VictimizationTrauma", "Anxiety"): -0.18,
-        ("FinancialStress", "Depression"): -0.25,
-        ("SocialIsolation", "Depression"): 0.25,
-    }
-    max_abs_beta = max(abs(float(path["beta"])) for path in paths_to_draw)
-    max_abs_beta = max(max_abs_beta, 1e-9)
 
-    for path in paths_to_draw:
-        source = path["source"]
-        target = path["target"]
-        edge = (source, target)
-        source_x, source_y = pos_sem[source]
-        target_x, target_y = pos_sem[target]
-        beta = float(path["beta"])
-        color = COLOR_POSITIVE if beta > 0 else COLOR_NEGATIVE
-        edge_width = 1.5 + 4.0 * (abs(beta) / max_abs_beta)
-        curve = edge_curves.get(edge, 0.0)
+    # ------------------------------------------------------------
+    # Prediction node
+    # ------------------------------------------------------------
 
-        ax.annotate(
-            "",
-            xy=(target_x - 0.38, target_y),
-            xytext=(source_x + 0.38, source_y),
-            arrowprops={
-                "arrowstyle": "-|>",
-                "color": color,
-                "lw": edge_width,
-                "alpha": 0.72,
-                "mutation_scale": 20,
-                "shrinkA": 4,
-                "shrinkB": 4,
-                "connectionstyle": f"arc3,rad={curve}",
-            },
-            zorder=1,
-        )
+    prediction_x = 5.0
+    prediction_y = 8.8
 
-        label_x = (source_x + target_x) / 2
-        label_y = (source_y + target_y) / 2 + edge_label_offsets.get(edge, 0.08)
-        ax.text(
-            label_x,
-            label_y,
-            f"β = {beta:+.3f}\n{format_p_value(float(path['p']))}",
-            color="#111111",
-            ha="center",
-            va="center",
-            fontsize=8,
-            bbox={"boxstyle": "round,pad=0.22", "fc": "white", "ec": "#d4d4d4", "alpha": 0.92},
-        )
+    ax.text(
+        prediction_x,
+        prediction_y,
+        (
+            "Predicted Depression\n"
+            f"{prediction:.2f}"
+        ),
+        ha="center",
+        va="center",
+        fontsize=15,
+        color="white",
+        fontweight="bold",
+        bbox={
+            "boxstyle":
+                "round,pad=0.65,rounding_size=0.15",
+            "fc": "#222222",
+            "ec": "white",
+            "lw": 2,
+        },
+        zorder=10,
+    )
 
-    for node in graph_nodes:
-        node_x, node_y = pos_sem[node]
-        is_dominant = node == dominant_group
-        if node == "Depression":
-            color = COLOR_OUTCOME
-        elif is_dominant:
-            color = "#8a5a00"
-        else:
-            color = "#2f6f95"
+    if base_value is not None:
 
         ax.text(
-            node_x + 0.035,
-            node_y - 0.045,
-            SEM_NODE_LABELS[node],
+            prediction_x,
+            9.75,
+            f"Model baseline = {base_value:.2f}",
             ha="center",
             va="center",
             fontsize=9,
-            color="#333333",
-            fontweight="bold",
-            bbox={
-                "boxstyle": "round,pad=0.58,rounding_size=0.18",
-                "fc": "#000000",
-                "ec": "none",
-                "alpha": 0.12,
-            },
-            zorder=3,
+            color="#666666",
         )
+
+    # ------------------------------------------------------------
+    # Individual factors
+    # ------------------------------------------------------------
+
+    n_groups = len(top_groups)
+
+    factor_xs = np.linspace(
+        1.0,
+        9.0,
+        n_groups,
+    )
+
+    factor_y = 5.7
+
+    max_abs = max(
+        float(top_groups["group_abs"].max()),
+        1e-9,
+    )
+
+    factor_positions = {}
+
+    for x, (_, row) in zip(
+        factor_xs,
+        top_groups.iterrows(),
+    ):
+
+        group = str(row["group"])
+
+        shap_value = float(
+            row["group_shap"]
+        )
+
+        group_abs = float(
+            row["group_abs"]
+        )
+
+        score = get_group_score(
+            group,
+            shap_table,
+            raw_feature_values,
+        )
+
+        factor_positions[group] = (
+            x,
+            factor_y,
+        )
+
+        # -----------------------------------------
+        # Direction
+        # -----------------------------------------
+
+        if shap_value > 0:
+
+            color = COLOR_POSITIVE
+
+            impact_text = (
+                f"SHAP {shap_value:+.2f} ↑"
+            )
+
+        elif shap_value < 0:
+
+            color = COLOR_NEGATIVE
+
+            impact_text = (
+                f"SHAP {shap_value:+.2f} ↓"
+            )
+
+        else:
+
+            color = COLOR_NEUTRAL
+
+            impact_text = (
+                f"SHAP {shap_value:+.2f}"
+            )
+
+        if score is not None:
+
+            score_text = (
+                f"Factor score {score:+.2f}"
+            )
+
+        else:
+
+            score_text = ""
+
+        label = (
+            f"{SEM_NODE_LABELS.get(group, group)}\n"
+            f"{score_text}\n"
+            f"{impact_text}"
+        )
+
+        relative_strength = (
+            group_abs / max_abs
+        )
+
+        # -----------------------------------------
+        # Factor node
+        # -----------------------------------------
+
         ax.text(
-            node_x,
-            node_y,
-            SEM_NODE_LABELS[node],
+            x,
+            factor_y,
+            label,
             ha="center",
             va="center",
             fontsize=9,
             color="white",
             fontweight="bold",
             bbox={
-                "boxstyle": "round,pad=0.58,rounding_size=0.18",
+                "boxstyle":
+                    "round,pad=0.45,"
+                    "rounding_size=0.12",
                 "fc": color,
-                "ec": "#f2c94c" if is_dominant else "white",
-                "lw": 2.8 if is_dominant else 1.5,
-                "alpha": 0.96,
+                "ec": (
+                    "#f2c94c"
+                    if group == dominant_group
+                    else "white"
+                ),
+                "lw": (
+                    3
+                    if group == dominant_group
+                    else 1.5
+                ),
             },
             zorder=5,
         )
 
-        if is_dominant:
-            ax.text(
-                node_x,
-                node_y - 0.5,
-                f"dominant SHAP: {group_shap.get(node, 0.0):+.2f}",
-                ha="center",
-                va="top",
-                fontsize=8,
-                color="#333333",
-                bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#f2c94c", "alpha": 0.95},
-            )
+        # -----------------------------------------
+        # Factor -> Prediction
+        #
+        # IMPORTANT:
+        # thickness represents INDIVIDUAL SHAP
+        # NOT SEM beta.
+        # -----------------------------------------
 
-    if base_value is not None:
-        ax.text(
-            pos_sem["Depression"][0],
-            pos_sem["Depression"][1] - 0.58,
-            f"base {base_value:.2f}",
-            ha="center",
-            va="top",
-            fontsize=9,
-            color="#555555",
-            bbox={"boxstyle": "round,pad=0.2", "fc": "white", "ec": "#d4d4d4", "alpha": 0.9},
+        edge_width = (
+            0.8
+            + 6.0 * relative_strength
         )
+
+        ax.annotate(
+            "",
+            xy=(
+                prediction_x,
+                prediction_y - 0.65,
+            ),
+            xytext=(
+                x,
+                factor_y + 0.65,
+            ),
+            arrowprops={
+                "arrowstyle": "-|>",
+                "color": color,
+                "lw": edge_width,
+                "alpha": 0.65,
+                "mutation_scale": 15,
+            },
+            zorder=1,
+        )
+
+    # ------------------------------------------------------------
+    # Labels explaining SHAP edges
+    # ------------------------------------------------------------
 
     ax.text(
-        2.0,
-        1.85,
-        f"Dominant individual driver highlighted: {dominant_group}",
+        5.0,
+        7.25,
+        "Individual contribution to prediction (SHAP)",
         ha="center",
-        va="bottom",
-        fontsize=11,
-        fontweight="bold",
+        va="center",
+        fontsize=9,
+        color="#555555",
+        style="italic",
     )
 
-    ax.set_xlim(-0.85, 4.85)
-    ax.set_ylim(-2.05, 2.3)
-    ax.axis("off")
-    ax.set_title("A. Population-Level SEM Paths (β and p-value)", fontsize=13, pad=14)
+    # ============================================================
+    # SEM CONTEXT AROUND DOMINANT FACTOR ONLY
+    # ============================================================
 
-    ax = axes[1]
-    ax.set_facecolor(PANEL_BACKGROUND)
-    individual_df = latent_shap.sort_values("shap_value").reset_index(drop=True)
-    feature_display = (
-        individual_df["feature"]
-        .astype(str)
-        .map(display_feature_name)
-    )
-    shap_values = individual_df["shap_value"].to_numpy(dtype=float)
-    colors = np.where(shap_values > 0, COLOR_POSITIVE, COLOR_NEGATIVE)
+    if dominant_group is not None:
 
-    ax.barh(feature_display, shap_values, color=colors, alpha=0.9)
-    ax.axvline(0, color="#333333", linewidth=1)
-    ax.set_xlabel("SHAP contribution to predicted PHQ")
-    ax.set_title(f"B. Individual Prediction — Predicted PHQ = {prediction:.2f}")
-    ax.grid(axis="x", linestyle="--", alpha=0.22)
-    ax.spines[["top", "right", "left"]].set_visible(False)
-    ax.tick_params(axis="y", length=0)
-
-    x_span = max(float(np.max(np.abs(shap_values))) if len(shap_values) else 1.0, 1e-9)
-    for y_position, (_, row) in enumerate(individual_df.iterrows()):
-        shap_value = float(row["shap_value"])
-        feature_name = str(row["feature"])
-        if raw_feature_values is not None and feature_name in raw_feature_values.index:
-            feature_value = float(raw_feature_values[feature_name])
-        else:
-            feature_value = float(row["value"])
-        offset = 0.035 * x_span if shap_value >= 0 else -0.035 * x_span
-        ha = "left" if shap_value >= 0 else "right"
-        ax.text(
-            shap_value + offset,
-            y_position,
-            f"SHAP={shap_value:+.2f} | score={feature_value:+.2f}",
-            va="center",
-            ha=ha,
-            fontsize=9,
-            color="#262626",
+        context = get_sem_context_for_group(
+            dominant_group,
+            sem_paths,
         )
 
-    figure.suptitle(
-        "Individual Structural-Predictive Explanation",
-        fontsize=15,
+        upstream = context["upstream"]
+
+        dominant_x, dominant_y = (
+            factor_positions[
+                dominant_group
+            ]
+        )
+
+        # Maximum 4 upstream SEM factors
+        upstream = upstream[:4]
+
+        if upstream:
+
+            context_y = 2.0
+
+            context_xs = np.linspace(
+                max(0.8, dominant_x - 2.0),
+                min(9.2, dominant_x + 2.0),
+                len(upstream),
+            )
+
+            for context_x, path in zip(
+                context_xs,
+                upstream,
+            ):
+
+                source = str(
+                    path["source"]
+                )
+
+                beta = float(
+                    path["beta"]
+                )
+
+                p_value = float(
+                    path.get(
+                        "p",
+                        np.nan,
+                    )
+                )
+
+                source_label = (
+                    SEM_NODE_LABELS.get(
+                        source,
+                        source,
+                    )
+                )
+
+                ax.text(
+                    context_x,
+                    context_y,
+                    source_label,
+                    ha="center",
+                    va="center",
+                    fontsize=8.5,
+                    color="white",
+                    fontweight="bold",
+                    bbox={
+                        "boxstyle":
+                            "round,pad=0.35",
+                        "fc": "#64748b",
+                        "ec": "white",
+                    },
+                    zorder=5,
+                )
+
+                # SEM relationship
+                ax.annotate(
+                    "",
+                    xy=(
+                        dominant_x,
+                        dominant_y - 0.65,
+                    ),
+                    xytext=(
+                        context_x,
+                        context_y + 0.45,
+                    ),
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "color": "#888888",
+                        "lw":
+                            1.2
+                            + 2.0 * abs(beta),
+                        "alpha": 0.55,
+                        "mutation_scale": 13,
+                    },
+                    zorder=1,
+                )
+
+                mid_x = (
+                    context_x
+                    + dominant_x
+                ) / 2
+
+                mid_y = (
+                    context_y
+                    + dominant_y
+                ) / 2
+
+                if np.isfinite(p_value):
+
+                    beta_label = (
+                        f"β={beta:+.2f}\n"
+                        f"{format_p_value(p_value)}"
+                    )
+
+                else:
+
+                    beta_label = (
+                        f"β={beta:+.2f}"
+                    )
+
+                ax.text(
+                    mid_x,
+                    mid_y,
+                    beta_label,
+                    fontsize=7,
+                    ha="center",
+                    va="center",
+                    color="#555555",
+                    bbox={
+                        "boxstyle":
+                            "round,pad=0.15",
+                        "fc": "white",
+                        "ec": "#dddddd",
+                        "alpha": 0.90,
+                    },
+                )
+
+            ax.text(
+                dominant_x,
+                0.75,
+                (
+                    "Population-level context around "
+                    f"{SEM_NODE_LABELS.get(dominant_group, dominant_group).replace(chr(10), ' ')}"
+                ),
+                ha="center",
+                fontsize=8.5,
+                color="#666666",
+                style="italic",
+            )
+
+    # ============================================================
+    # B. DETAILED INDIVIDUAL CONTRIBUTIONS
+    # ============================================================
+
+    ax_detail.set_facecolor(
+        PANEL_BACKGROUND
+    )
+
+    top_features = (
+        shap_table
+        .sort_values(
+            "abs_shap",
+            ascending=False,
+        )
+        .head(int(max_display))
+        .sort_values(
+            "shap_value",
+            ascending=True,
+        )
+    )
+
+    values = top_features[
+        "shap_value"
+    ].to_numpy(dtype=float)
+
+    labels = (
+        top_features["feature"]
+        .astype(str)
+        .map(display_feature_name)
+        .tolist()
+    )
+
+    colors = [
+        (
+            COLOR_POSITIVE
+            if value >= 0
+            else COLOR_NEGATIVE
+        )
+        for value in values
+    ]
+
+    y = np.arange(
+        len(top_features)
+    )
+
+    ax_detail.barh(
+        y,
+        values,
+        color=colors,
+        alpha=0.9,
+    )
+
+    ax_detail.set_yticks(y)
+
+    ax_detail.set_yticklabels(
+        labels,
+        fontsize=8.5,
+    )
+
+    ax_detail.axvline(
+        0,
+        color="#333333",
+        lw=1,
+    )
+
+    ax_detail.grid(
+        axis="x",
+        linestyle="--",
+        alpha=0.18,
+    )
+
+    ax_detail.spines[
+        ["top", "right", "left"]
+    ].set_visible(False)
+
+    ax_detail.tick_params(
+        axis="y",
+        length=0,
+    )
+
+    ax_detail.set_xlabel(
+        "SHAP contribution to predicted depression"
+    )
+
+    ax_detail.set_title(
+        "Detailed Individual Contributions",
+        fontsize=12,
         fontweight="bold",
     )
-    figure.tight_layout()
-    return figure
+
+    # ------------------------------------------------------------
+    # SHAP labels
+    # ------------------------------------------------------------
+
+    max_abs_feature = max(
+        np.max(np.abs(values))
+        if len(values)
+        else 1.0,
+        1e-9,
+    )
+
+    offset = (
+        0.025 * max_abs_feature
+    )
+
+    for yy, value in zip(
+        y,
+        values,
+    ):
+
+        if value >= 0:
+            xx = value + offset
+            ha = "left"
+        else:
+            xx = value - offset
+            ha = "right"
+
+        ax_detail.text(
+            xx,
+            yy,
+            f"{value:+.3f}",
+            va="center",
+            ha=ha,
+            fontsize=8,
+            fontweight="bold",
+        )
+
+    # ============================================================
+    # FOOTNOTE
+    # ============================================================
+
+    fig.text(
+        0.5,
+        0.015,
+        (
+            "SHAP = contribution to this student's model prediction. "
+            "β = population-level SEM association. "
+            "These quantities describe model contributions and "
+            "associations, not causal effects."
+        ),
+        ha="center",
+        fontsize=8,
+        color="#666666",
+        style="italic",
+    )
+
+    fig.subplots_adjust(
+        top=0.92,
+        bottom=0.07,
+        left=0.12,
+        right=0.96,
+    )
+
+    return fig
 
 
 def make_app() -> gr.Blocks:
